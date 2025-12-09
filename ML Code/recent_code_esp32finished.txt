@@ -1,0 +1,655 @@
+import time
+import wifi
+import socketpool
+import ssl
+import adafruit_requests
+import json
+import board
+import busio
+from adafruit_bus_device.i2c_device import I2CDevice
+import displayio
+import terminalio
+from adafruit_display_text import bitmap_label
+import math
+# === CONFIGURATION ===
+FIREBASE_HOST = "smarthealthjplevtr-default-rtdb.firebaseio.com"
+FIREBASE_AUTH = "eAfRMU6wFdMJ9TYrEL2km6hhASVSsBwMlEH3vMP0"
+BASE_DATA_PATH = "/SensorData"
+COMMAND_PATH = "/command"
+
+#time
+Current_Time = "/Time"
+
+UID_PATH = "/UID"
+TEST_PATH = "/Test"
+WIFI_SSID = "TAMU_IoT"
+DEVICE_MAC = "24EC4A319B0C"
+# I2C addresses
+BMA250_ADDR = 0x18
+MAX30101_ADDR = 0x57
+# BMA250 registers
+REG_RANGE = 0x0F
+REG_BANDWIDTH = 0x10
+REG_DATA_START = 0x02
+# MAX30101 registers
+REG_FIFO_WR_PTR = 0x04
+REG_FIFO_RD_PTR = 0x06
+REG_FIFO_DATA = 0x07
+# === 30 Hz SYSTEM ===
+SAMPLES_PER_BATCH = 30
+SAMPLE_INTERVAL = 1.0 / 30 # ~0.033 sec = 30 Hz
+BATCH_DURATION = 1.0 # 1 second per batch
+# Timing & Limits
+CHECK_INTERVAL = 2 # Keep consistent to respond quickly to commands
+TIME_CHECK_INTERVAL = 60  # Check /Time every ~60 seconds
+# Calibration delay after start
+CALIBRATION_DELAY = 6 # Increased to 6 seconds
+# Global state
+data_log = [] # Not used, but kept for compatibility
+batch_index = 0
+logging_active = False
+last_sample_time = 0
+last_check_time = 0
+last_time_check_time = 0
+current_uid = "Jim"
+current_time_value = "N/A"
+current_test_value = 0
+calibration_active = False # No startup calibration now
+session = None
+# I2C @ 400 kHz
+i2c = busio.I2C(board.SCL, board.SDA, frequency=400000)
+# Scan I2C bus for devices
+print("Scanning I2C bus...")
+i2c.try_lock()
+addresses = i2c.scan()
+print("I2C addresses found:", [hex(a) for a in addresses])
+i2c.unlock()
+if BMA250_ADDR not in addresses:
+    print(f"BMA250 not found at 0x{BMA250_ADDR:x}. If 0x19 is shown, change BMA250_ADDR to 0x19 and rerun.")
+if MAX30101_ADDR not in addresses:
+    print(f"MAX30101 not found at 0x{MAX30101_ADDR:x}. Check connections.")
+bma250 = I2CDevice(i2c, BMA250_ADDR)
+max30101 = I2CDevice(i2c, MAX30101_ADDR)
+# Calculation constants
+SAMPLE_FREQ = 30
+MA_SIZE = 6 # Increased for more smoothing
+BUFFER_SIZE = 120 # 4 seconds for more beats
+MIN_FINGER_LEVEL = 5000
+MIN_DIST = 12 # Min samples between peaks (~0.4s, 150bpm max)
+# ====== Helpers ======
+def _int_mean(seq):
+    n = len(seq)
+    if n == 0:
+        return 0
+    s = 0
+    for v in seq:
+        s += v
+    return s // n
+def _clamp(v, lo, hi):
+    return lo if v < lo else (hi if v > hi else v)
+def _moving_average_inplace(x, window):
+    n = len(x)
+    if window <= 0 or n == 0 or n < window:
+        return
+    run_sum = 0
+    for i in range(window):
+        run_sum += x[i]
+    limit = n - window
+    original = x[:]
+    for i in range(limit):
+        avg = run_sum // window
+        x[i] = avg
+        if i + window < n:
+            run_sum += original[i + window] - original[i]
+# ====== Peak detection ======
+def find_peaks(x, size, min_height, min_dist, max_num):
+    locs, n = find_peaks_above_min_height(x, size, min_height, max_num)
+    locs, n = remove_close_peaks(n, locs, x, min_dist)
+    if n > max_num:
+        locs = locs[:max_num]; n = max_num
+    return locs, n
+def find_peaks_above_min_height(x, size, min_height, max_num):
+    i = 0
+    n_peaks = 0
+    locs = []
+    while i < size - 1:
+        cur = x[i]
+        prev = x[i - 1] if i > 0 else cur
+        if cur > min_height and cur > prev:
+            n_width = 1
+            while (i + n_width) < (size - 1) and x[i] == x[i + n_width]:
+                n_width += 1
+            if x[i] > x[i + n_width] and n_peaks < max_num:
+                locs.append(i)
+                n_peaks += 1
+                i += n_width + 1
+            else:
+                i += n_width
+        else:
+            i += 1
+    return locs, n_peaks
+def remove_close_peaks(n_peaks, locs, x, min_dist):
+    if n_peaks <= 1:
+        return locs, n_peaks
+    sorted_by_amp = sorted(locs, key=lambda idx: x[idx], reverse=True)
+    kept = []
+    for idx in sorted_by_amp:
+        far = True
+        for k in kept:
+            if abs(idx - k) < min_dist:
+                far = False; break
+        if far:
+            kept.append(idx)
+        if len(kept) >= n_peaks:
+            break
+    kept.sort()
+    return kept, len(kept)
+# ====== HR/SpO2 calculation ======
+def calc_hr_and_spo2(ir_data, red_data):
+    if (not ir_data) or (not red_data) or (len(ir_data) != len(red_data)):
+        return -999, False, -999, False
+    size = BUFFER_SIZE if BUFFER_SIZE <= len(ir_data) else len(ir_data)
+    ir_mean = _int_mean(ir_data[:size])
+    x = [-(ir_data[i] - ir_mean) for i in range(size)]
+    _moving_average_inplace(x, MA_SIZE)
+    n_th = _clamp(_int_mean(x), 5, 20) # Lowered threshold
+    ir_valley_locs, n_peaks = find_peaks(x, size, n_th, min_dist=MIN_DIST, max_num=15)
+    print(f"Detected {n_peaks} peaks with threshold {n_th}")
+    # HR calculation
+    if n_peaks >= 2:
+        peak_interval_sum = 0
+        for i in range(1, n_peaks):
+            peak_interval_sum += (ir_valley_locs[i] - ir_valley_locs[i - 1])
+        peak_interval = peak_interval_sum // (n_peaks - 1)
+        if peak_interval <= 0:
+            hr = -999; hr_valid = False
+        else:
+            hr = int(SAMPLE_FREQ * 60 // peak_interval)
+            hr_valid = True
+    else:
+        hr = -999; hr_valid = False
+    # SpO2 calculation
+    ratios = []
+    for k in range(n_peaks - 1):
+        left = ir_valley_locs[k]
+        right = ir_valley_locs[k + 1]
+        if right - left <= 3:
+            continue
+        red_dc_max = -16777216
+        ir_dc_max = -16777216
+        red_dc_idx = left
+        ir_dc_idx = left
+        for i in range(left, right):
+            v_ir = ir_data[i]
+            v_red = red_data[i]
+            if v_ir > ir_dc_max:
+                ir_dc_max = v_ir; ir_dc_idx = i
+            if v_red > red_dc_max:
+                red_dc_max = v_red; red_dc_idx = i
+        span = right - left
+        red_base = red_data[left] + ((red_data[right] - red_data[left]) * (red_dc_idx - left)) // span
+        ir_base = ir_data[left] + ((ir_data[right] - ir_data[left]) * (ir_dc_idx - left)) // span
+        red_ac = red_data[red_dc_idx] - red_base
+        ir_ac = ir_data[ir_dc_idx] - ir_base
+        denom = ir_ac * red_dc_max
+        nume = red_ac * ir_dc_max
+        if denom > 0 and nume != 0 and len(ratios) < 5:
+            ratios.append(((nume * 100) & 0xFFFFFFFF) // denom)
+    ratio_ave = 0
+    if len(ratios) > 0:
+        ratios.sort()
+        mid = len(ratios) // 2
+        if len(ratios) >= 2 and (len(ratios) % 2 == 0):
+            ratio_ave = (ratios[mid - 1] + ratios[mid]) // 2
+        else:
+            ratio_ave = ratios[mid]
+    if 2 < ratio_ave < 184:
+        r = float(ratio_ave)
+        spo2 = (-45.060 * (r * r) / 10000.0) + (30.054 * r / 100.0) + 94.845
+        spo2_valid = True
+    else:
+        spo2 = -999; spo2_valid = False
+    return hr, hr_valid, spo2, spo2_valid
+# ====== Ring buffer ======
+class RingBuffer:
+    def __init__(self, size):
+        self.buf = [0] * size
+        self.size = size
+        self.idx = 0
+        self.count = 0
+    def append(self, value):
+        self.buf[self.idx] = value
+        self.idx += 1
+        if self.idx >= self.size:
+            self.idx = 0
+        if self.count < self.size:
+            self.count += 1
+    def full(self):
+        return self.count >= self.size
+    def to_list(self):
+        if self.count < self.size:
+            return self.buf[:self.count]
+        out = [0] * self.size
+        start = self.idx
+        for j in range(self.size):
+            pos = start + j
+            if pos >= self.size:
+                pos -= self.size
+            out[j] = self.buf[pos]
+        return out
+    def mean(self):
+        if self.count == 0:
+            return 0
+        return sum(self.buf[:self.count] if self.count < self.size else self.buf) // self.count
+# Buffers for calculations
+red_buf = RingBuffer(BUFFER_SIZE)
+ir_buf = RingBuffer(BUFFER_SIZE)
+bpms = RingBuffer(4)
+x_batch = []
+y_batch = []
+z_batch = []
+# === I2C HELPERS ===
+def write_reg(device, reg, value):
+    with device as i2c_dev:
+        i2c_dev.write(bytes([reg, value]))
+def read_regs(device, reg, nbytes):
+    result = bytearray(nbytes)
+    with device as i2c_dev:
+        i2c_dev.write_then_readinto(bytes([reg]), result)
+    return result
+# === SENSOR INIT ===
+def init_sensors():
+    print("Initializing sensors for 30 Hz (effective)...")
+    try:
+        # BMA250: ±2g, 125 Hz bandwidth
+        write_reg(bma250, REG_RANGE, 0x03)
+        write_reg(bma250, REG_BANDWIDTH, 0x0C) # 125 Hz
+        # MAX30101: SpO2 mode, 200 Hz sample rate, average 4 for ~50 Hz, but sample at 30 Hz rate
+        write_reg(max30101, 0x09, 0x40) # Reset
+        time.sleep(0.1)
+        write_reg(max30101, 0x09, 0x03) # SpO2 mode
+        write_reg(max30101, 0x0A, 0x2B) # ADC_RGE=01, SR=010 (200 Hz), PW=11
+        write_reg(max30101, 0x0C, 0x24) # LED1 (Red) current
+        write_reg(max30101, 0x0D, 0x24) # LED2 (IR) current
+        write_reg(max30101, 0x08, 0x50) # FIFO: SMP_AVE=010 (4 avg, effective ~50 Hz), rollover=1, A_FULL=0000
+        time.sleep(0.5)
+        # Clear FIFO
+        for _ in range(32):
+            read_regs(max30101, 0x07, 6)
+        print("Sensors initialized: effective 30 Hz sampling")
+    except Exception as e:
+        print(f"Sensor init failed: {e}")
+        raise
+# === WIFI CONNECTION ===
+def connect_wifi():
+    print(f"Connecting to {WIFI_SSID}...")
+    try:
+        wifi.radio.connect(WIFI_SSID)
+        print(f"Connected! IP: {wifi.radio.ipv4_address}")
+    except Exception as e:
+        print(f"WiFi failed: {e}")
+        time.sleep(5)
+        raise SystemExit
+# === FIREBASE SETUP ===
+def firebase_init():
+    global session, current_uid, current_time_value, current_test_value
+    pool = socketpool.SocketPool(wifi.radio)
+    session = adafruit_requests.Session(pool, ssl.create_default_context())
+    print("Initializing Firebase paths...")
+    try:
+        put_url(f"{COMMAND_PATH}.json", "idle")
+        uid = get_url(f"{UID_PATH}.json")
+        if uid and uid != current_uid:
+            current_uid = uid
+            print(f"UID set from Firebase: {current_uid}")
+        else:
+            put_url(f"{UID_PATH}.json", current_uid)
+            print(f"UID set to default: {current_uid}")
+        time_data = get_url(f"{Current_Time}.json")
+        if time_data is not None:
+            current_time_value = time_data
+        test_data = get_url(f"{TEST_PATH}.json")
+        if test_data is not None:
+            current_test_value = test_data
+        else:
+            put_url(f"{TEST_PATH}.json", 0)
+            current_test_value = 0
+    except Exception as e:
+        print(f"Firebase init failed: {e}")
+def get_url(path):
+    try:
+        response = session.get(f"https://{FIREBASE_HOST}{path}?auth={FIREBASE_AUTH}")
+        if response.status_code == 200:
+            return response.json()
+        else:
+            print(f"GET failed: {response.text}")
+            return None
+    except Exception as e:
+        print(f"GET error: {e}")
+        return None
+def put_url(path, value):
+    try: 
+        response = session.put(
+            f"https://{FIREBASE_HOST}{path}?auth={FIREBASE_AUTH}",
+            json=value
+        )
+        return response.status_code == 200
+    except Exception as e:
+        print(f"PUT error: {e}")
+        return False
+# === UID & COMMAND HANDLING ===
+def set_uid(new_uid):
+    global current_uid
+    if new_uid and new_uid != current_uid:
+        current_uid = new_uid
+        print(f"UID updated: {current_uid}")
+        put_url(f"{UID_PATH}.json", current_uid)
+def check_firebase_commands():
+    global last_check_time, logging_active, current_time_value, current_test_value, last_time_check_time
+    now = time.monotonic()
+    if now - last_check_time < CHECK_INTERVAL:
+        return
+    last_check_time = now
+    try:
+        uid = get_url(f"{UID_PATH}.json")
+        if uid and uid != current_uid:
+            set_uid(uid)
+        cmd = get_url(f"{COMMAND_PATH}.json")
+        if cmd and cmd != "idle" and cmd != "logging" and cmd != "connection lost, finding pulse":
+            print(f"Command received: {cmd}")
+            if cmd == "start":
+                start_logging()
+                put_url(f"{COMMAND_PATH}.json", "logging")
+            elif cmd == "stop":
+                stop_logging()
+                put_url(f"{COMMAND_PATH}.json", "idle")
+            elif cmd == "clear":
+                clear_old_rows()
+                put_url(f"{COMMAND_PATH}.json", "idle")
+            elif cmd == "get_log":
+                upload_last_batch()
+                put_url(f"{COMMAND_PATH}.json", "idle")
+            else:
+                put_url(f"{COMMAND_PATH}.json", "idle")
+        # Check time only every ~60 seconds
+        if now - last_time_check_time >= TIME_CHECK_INTERVAL:
+            time_data = get_url(f"{Current_Time}.json")
+            if time_data is not None:
+                current_time_value = time_data
+            last_time_check_time = now
+        test_data = get_url(f"{TEST_PATH}.json")
+        if test_data is not None:
+            current_test_value = test_data
+    except Exception as e:
+        print(f"Command check failed: {e}")
+# === SENSOR READING ===
+def read_max30101():
+    try:
+        wr_ptr = read_regs(max30101, REG_FIFO_WR_PTR, 1)[0]
+        rd_ptr = read_regs(max30101, REG_FIFO_RD_PTR, 1)[0]
+        num_samples = (wr_ptr - rd_ptr) & 0x1F
+        red_sum = 0
+        ir_sum = 0
+        for _ in range(num_samples):
+            fifo = read_regs(max30101, REG_FIFO_DATA, 6)
+            red = (fifo[0] << 16 | fifo[1] << 8 | fifo[2]) & 0x03FFFF
+            ir = (fifo[3] << 16 | fifo[4] << 8 | fifo[5]) & 0x03FFFF
+            red_sum += red
+            ir_sum += ir
+        if num_samples > 0:
+            print(f"Read {num_samples} samples from MAX30101")
+            return red_sum // num_samples, ir_sum // num_samples
+        else:
+            print("No samples in FIFO")
+            return None, None
+    except Exception as e:
+        print(f"MAX30101 read error: {e}")
+        return None, None
+def read_sensors():
+    try:
+        # BMA250
+        data = read_regs(bma250, REG_DATA_START, 6)
+        x = ((data[1] << 8) | (data[0] & 0xC0)) >> 6
+        if x > 511: x -= 1024
+        y = ((data[3] << 8) | (data[2] & 0xC0)) >> 6
+        if y > 511: y -= 1024
+        z = ((data[5] << 8) | (data[4] & 0xC0)) >> 6
+        if z > 511: z -= 1024
+        # MAX30101
+        red, ir = read_max30101()
+        return red, ir, x, y, z
+    except Exception as e:
+        print(f"Sensor read error: {e}")
+        return None, None, None, None, None
+# === SAMPLE AT 30 Hz ===
+def sample_data():
+    global last_sample_time, batch_index
+    now = time.monotonic()
+    if now - last_sample_time < SAMPLE_INTERVAL:
+        return
+    last_sample_time = now
+    red, ir, x, y, z = read_sensors()
+    if red is None:
+        print("Skipping sample due to read error")
+        return # Skip on error
+    red_buf.append(red)
+    ir_buf.append(ir)
+    x_batch.append(x)
+    y_batch.append(y)
+    z_batch.append(z)
+    batch_index += 1
+    # Full batch? Compute and transmit
+    if batch_index >= SAMPLES_PER_BATCH:
+        transmit_data()
+        x_batch.clear()
+        y_batch.clear()
+        z_batch.clear()
+        batch_index = 0
+# === UPDATE VITALS ===
+def update_vitals():
+    global bpm, spo2
+    if red_buf.count < BUFFER_SIZE:
+        return
+    ir_data = ir_buf.to_list()
+    red_data = red_buf.to_list()
+    hr, valid_hr, sp, valid_sp = calc_hr_and_spo2(ir_data, red_data)
+    if valid_hr:
+        bpms.append(hr)
+        bpm_temp = bpms.mean() - 7
+        if ir_buf.mean() < MIN_FINGER_LEVEL and red_buf.mean() < MIN_FINGER_LEVEL:
+            bpm = 0
+            spo2 = 0.0
+            print("Finger not detected")
+        else:
+            bpm = bpm_temp
+            print(f"Calculated BPM: {bpm}")
+            if valid_sp:
+                spo2 = round(sp, 1)
+                if bpm < 70:
+                    spo2 = max(spo2, 95.0)
+                print(f"Calculated SPO2: {spo2}")
+            else:
+                spo2 = 0.0
+                print("SPO2 invalid")
+    else:
+        bpm = 0
+        spo2 = 0.0
+        print("BPM invalid; waiting for more peaks")
+# === TRANSMIT DATA TO SAME NODE ===
+def transmit_data():
+    if not current_uid:
+        return
+    update_vitals()
+    # Compute averages for accel
+    avg_x = _int_mean(x_batch) if x_batch else 0
+    avg_y = _int_mean(y_batch) if y_batch else 0
+    avg_z = _int_mean(z_batch) if z_batch else 0
+    data = {
+        "BPM": bpm,
+        "SPO2": spo2,
+        "X": avg_x,
+        "Y": avg_y,
+        "Z": avg_z
+    }
+    path = f"{BASE_DATA_PATH}/{current_uid}.json"
+    if put_url(path, data):
+        print(f"Uploaded data to {path}: {data}")
+    else:
+        print("Data upload failed.")
+    # Send communication if BPM or SPO2 is zero
+    if logging_active:
+        if bpm == 0 or spo2 == 0.0:
+            put_url(f"{COMMAND_PATH}.json", "connection lost, finding pulse")
+        else:
+            put_url(f"{COMMAND_PATH}.json", "logging")
+    # After Firebase upload, update display with the latest calculated values
+    update_display_values(current_time_value, bpm, spo2)
+# === LOGGING & UPLOAD ===
+def upload_last_batch():
+    transmit_data()
+def start_logging():
+    global logging_active, batch_index, last_sample_time, CHECK_INTERVAL, red_buf, ir_buf, bpms
+    logging_active = True
+    batch_index = 0
+    last_sample_time = 0
+    CHECK_INTERVAL = 2.0 # Keep low for quick response
+    x_batch.clear()
+    y_batch.clear()
+    z_batch.clear()
+    red_buf = RingBuffer(BUFFER_SIZE)
+    ir_buf = RingBuffer(BUFFER_SIZE)
+    bpms = RingBuffer(4)
+    print("Logging STARTED @ 30 Hz → calculated data to same node")
+def stop_logging():
+    global logging_active, CHECK_INTERVAL
+    logging_active = False
+    CHECK_INTERVAL = 2.0
+    transmit_data()
+    print("Logging STOPPED")
+def clear_old_rows():
+    print("Clear command received; no long-term log to clear.")
+# ---------------------------
+# DISPLAY SETUP
+# ---------------------------
+display = board.DISPLAY
+# Load the default background image
+default_bitmap = displayio.OnDiskBitmap("/images/BloodWalk.bmp")
+heart_bitmap = displayio.OnDiskBitmap("/images/HeartBloodWalk.bmp")
+default_tile_grid = displayio.TileGrid(default_bitmap, pixel_shader=default_bitmap.pixel_shader)
+heart_tile_grid = displayio.TileGrid(heart_bitmap, pixel_shader=heart_bitmap.pixel_shader)
+# Create a display group for background
+group = displayio.Group()
+group.append(default_tile_grid)
+# Create labels for sensor values
+sensor_labels = []
+label_texts = ["", "", "", ""]
+label_positions = [
+    (display.width // 2, 60),       # Time
+    (display.width // 4, 120),      # BPM
+    (display.width // 1.5, 120),    # SpO2
+    (10, 10)                        # Test, top left
+]
+
+for i, (text, pos) in enumerate(zip(label_texts, label_positions)):
+    if i == 0:
+        # Time label — bigger (scale 4)
+        label = bitmap_label.Label(
+            terminalio.FONT,
+            scale=4,
+            text=f"{text}",
+            color=0x89CFF0
+        )
+        label.anchor_point = (0.5, 0.5)
+    elif i == 3:
+        # Test label — scale 2, top left aligned
+        label = bitmap_label.Label(
+            terminalio.FONT,
+            scale=2,
+            text=f"{text}",
+            color=0x89CFF0
+        )
+        label.anchor_point = (0.0, 0.0)
+    else:
+        # BPM and SPO2 — normal size (scale 2)
+        label = bitmap_label.Label(
+            terminalio.FONT,
+            scale=2,
+            text=f"{text}",
+            color=0x89CFF0
+        )
+        label.anchor_point = (0.5, 0.5)
+    label.anchored_position = pos
+    sensor_labels.append(label)
+
+# Create main display group
+main_group = displayio.Group()
+main_group.append(group)
+# Add all sensor labels to the display group
+for label in sensor_labels:
+    main_group.append(label)
+# Show everything on the display
+display.root_group = main_group
+# Track which image is showing
+current_background = "default"
+# ---------------------------
+# IMAGE SWITCH FUNCTION
+# ---------------------------
+def set_background_image(to_heart):
+    global current_background
+    if to_heart and current_background != "heart":
+        group[0] = heart_tile_grid
+        current_background = "heart"
+    elif not to_heart and current_background != "default":
+        group[0] = default_tile_grid
+        current_background = "default"
+# ---------------------------
+# UPDATE DISPLAY FUNCTION
+# ---------------------------
+def update_display_values(time_str, bpm, spo2):
+    sensor_labels[0].text = f"{time_str}"
+    sensor_labels[1].text = f"{bpm}"
+    sensor_labels[2].text = f"{spo2}"
+    sensor_labels[3].text = f"{current_test_value}"
+# === MAIN ===
+connect_wifi()
+init_sensors()
+# Initialize display after sensors
+update_display_values("N/A", 0, 0.0) # Initial zeros
+firebase_init()
+# No startup calibration
+put_url(f"{COMMAND_PATH}.json", "idle")
+print("Ready @ 30 Hz.")
+# Initialize globals for BPM and animation
+bpm = 0
+spo2 = 0.0
+last_beat_time = time.monotonic()
+is_showing_heart = False
+pulse_duration = 0.2 # Duration to show heart image in seconds
+last_frame_update = 0
+FRAME_RATE_LIMIT = 0.033  # ~30 FPS cap for display updates
+# Main loop
+while True:
+    current_time = time.monotonic()
+    check_firebase_commands()
+    if logging_active:
+        sample_data()
+    # Handle heart pulse animation only if needed and cap frame rate
+    if current_time - last_frame_update >= FRAME_RATE_LIMIT:
+        last_frame_update = current_time
+        if bpm > 0:
+            interval = 60.0 / bpm
+            if is_showing_heart:
+                if current_time - last_beat_time >= pulse_duration:
+                    set_background_image(False)
+                    is_showing_heart = False
+            else:
+                if current_time - last_beat_time >= interval:
+                    set_background_image(True)
+                    is_showing_heart = True
+                    last_beat_time = current_time
+        else:
+            if is_showing_heart:
+                set_background_image(False)
+            is_showing_heart = False
+            last_beat_time = current_time
+    time.sleep(0.001)
